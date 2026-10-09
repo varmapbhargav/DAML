@@ -1,0 +1,138 @@
+-- | Crown.Clearing
+-- Clearing submission and CCP workflow.
+-- Architecture §5.3, §11.6
+module Clearing where
+
+import Types
+import DA.Time (Time)
+
+-- ---------------------------------------------------------------------------
+-- ClearingSubmission
+-- ---------------------------------------------------------------------------
+
+-- | `ClearingSubmission` — represents a trade submitted for clearing to a
+-- CCP. Tracks acceptance, rejection, novation, and margin obligations.
+--
+-- Architecture §11.6: clearing is a separate integration and legal workflow.
+-- CROWN does not claim to be a CCP.
+template ClearingSubmission
+  with
+    submissionId         : Text
+    agreementId          : Text            -- source RepoAgreement
+    submittingMember     : Party           -- clearing member submitting the trade
+    counterpartyMember   : Party           -- other clearing member
+    clearingService      : Party           -- CCP party (observer/eventual signatory on novation)
+    clearingHouseRef     : Text            -- CCP's business identifier
+    instrumentId         : Text
+    notionalAmount       : Decimal
+    currency             : Text
+    submittedAt          : Time
+    status               : Text            -- "Pending" | "Accepted" | "Rejected"
+                                           -- | "Novated" | "ReconciliationRequired"
+    externalRef          : Optional Text   -- reference returned by the CCP
+    rejectionReason      : Optional Text
+    novationRef          : Optional Text   -- CCP-assigned novation reference
+    idempotencyKey       : Text
+  where
+    signatory submittingMember, counterpartyMember
+    observer clearingService
+
+    ensure
+      notionalAmount > 0.0
+      && idempotencyKey /= ""
+      && clearingHouseRef /= ""
+
+    -- | CCP acknowledges and accepts the submission.
+    -- Architecture §11.6: acceptance evidence from the CCP.
+    choice RecordClearingAcceptance : ContractId ClearingSubmission
+      with
+        externalRef : Text
+        novationRef : Text
+      controller clearingService
+      do
+        assertMsg "Submission must be Pending to be accepted"
+          (status == "Pending")
+        assertMsg "CCP external reference must be provided"
+          (externalRef /= "")
+        now <- getTime
+        create this with
+          status      = "Accepted"
+          externalRef = Some externalRef
+          novationRef = Some novationRef
+
+    -- | CCP rejects the submission.
+    choice RecordClearingRejection : ContractId ClearingSubmission
+      with
+        reason : Text
+      controller clearingService
+      do
+        assertMsg "Submission must be Pending to be rejected"
+          (status == "Pending")
+        assertMsg "Rejection reason must be provided"
+          (reason /= "")
+        create this with
+          status          = "Rejected"
+          rejectionReason = Some reason
+
+    -- | Record novation of the trade under CCP rules.
+    choice RecordNovation : ContractId ClearingSubmission
+      with novationDetails : Text
+      controller clearingService
+      do
+        assertMsg "Submission must be Accepted before novation"
+          (status == "Accepted")
+        create this with
+          status      = "Novated"
+          novationRef = Some novationDetails
+
+    -- | Flag submission as requiring reconciliation.
+    choice FlagClearingReconciliation : ContractId ClearingSubmission
+      with reason : Text
+      controller submittingMember, counterpartyMember
+      do
+        create this with status = "ReconciliationRequired"
+
+    -- | Correct and resubmit (creates a new submission; this one is archived).
+    choice CorrectAndResubmit : ContractId ClearingSubmission
+      with correctedSubmission : ClearingSubmission
+      controller submittingMember, counterpartyMember
+      do
+        assertMsg "Only Rejected or ReconciliationRequired submissions may be corrected"
+          (status == "Rejected" || status == "ReconciliationRequired")
+        create correctedSubmission
+
+-- ---------------------------------------------------------------------------
+-- ClearingMarginObligation (Initial / Variation Margin under CCP rules)
+-- ---------------------------------------------------------------------------
+
+-- | Tracks a margin obligation arising from a cleared position.
+-- Architecture §11.6: initial/variation margin obligations as applicable.
+template ClearingMarginObligation
+  with
+    obligationId     : Text
+    submissionId     : Text               -- cleared submission reference
+    clearingMember   : Party
+    clearingService  : Party
+    marginType       : Text               -- "InitialMargin" | "VariationMargin"
+    amount           : Decimal
+    currency         : Text
+    dueAt            : Time
+    status           : MarginStatus
+    createdAt        : Time
+  where
+    signatory clearingService
+    observer clearingMember
+
+    ensure
+      amount > 0.0
+
+    -- | Member satisfies the margin obligation.
+    choice SatisfyClearingMargin : ()
+      with evidenceRef : Text
+      controller clearingMember
+      do
+        assertMsg "Margin obligation must be Open or PartiallySatisfied"
+          (status == Open || status == PartiallySatisfied)
+        assertMsg "Evidence reference must be provided"
+          (evidenceRef /= "")
+        return ()

@@ -1,0 +1,82 @@
+-- | Crown.ReferenceData
+-- Eligibility policy and governed reference data for collateral eligibility.
+-- Architecture §5.3, §6.3, §11.1
+module ReferenceData where
+
+import Types (AssetClass)
+-- Date is in the Daml prelude; no explicit import needed.
+
+-- ---------------------------------------------------------------------------
+-- Eligibility policy
+-- ---------------------------------------------------------------------------
+
+-- | `EligibilityPolicy` — governs which instruments are acceptable as
+-- collateral, including asset classes, currencies, concentration and maturity.
+-- Each policy is versioned and signed off by the governing parties.
+template EligibilityPolicy
+  with
+    policyId             : Text            -- unique policy identifier
+    operator             : Party           -- CROWN operator that maintains the policy
+    eligibleAssetClasses : [AssetClass]    -- approved asset classes
+    allowedCurrencies    : [Text]          -- ISO 4217 currency codes
+    maxConcentration     : Decimal         -- max fraction in a single issuer/class (0..1)
+    minHaircut           : Decimal         -- minimum haircut required (0..1)
+    maxMaturityDays      : Int             -- maximum remaining maturity in days
+    policyVersion        : Int
+    effectiveDate        : Date
+    expiryDate           : Optional Date
+    approvers            : [Party]         -- parties whose approval is required
+  where
+    signatory operator
+    observer approvers
+
+    ensure
+      maxConcentration > 0.0 && maxConcentration <= 1.0
+      && minHaircut >= 0.0 && minHaircut < 1.0
+      && maxMaturityDays > 0
+
+    -- | Supersede this policy with a new version.
+    -- Only the operator may update; creates a new contract.
+    choice UpdatePolicy : ContractId EligibilityPolicy
+      with newVersion : EligibilityPolicy
+      controller operator
+      do
+        assertMsg "New version must be strictly greater"
+          (newVersion.policyVersion > policyVersion)
+        create newVersion
+
+    -- | Expire the policy explicitly.
+    choice ExpirePolicy : ()
+      controller operator
+      do
+        assertMsg "Policy must have an expiry date to be explicitly expired"
+          (expiryDate /= None)
+        return ()
+
+-- ---------------------------------------------------------------------------
+-- Calendar / convention record (referenced by RepoTerms.applicableCalendar)
+-- ---------------------------------------------------------------------------
+
+-- | `CalendarConvention` — names and owns a business-day calendar.
+-- The actual holiday schedule is maintained off-ledger; this record
+-- provides a governed reference to it.
+template CalendarConvention
+  with
+    calendarId    : Text    -- e.g. "INR_CCIL", "TARGET2"
+    operator      : Party
+    description   : Text
+    version       : Int
+    effectiveDate : Date
+  where
+    signatory operator
+
+    ensure version > 0
+
+    -- | Replace with a new version when calendar is updated.
+    choice UpdateCalendar : ContractId CalendarConvention
+      with newCalendar : CalendarConvention
+      controller operator
+      do
+        assertMsg "New calendar version must be greater"
+          (newCalendar.version > version)
+        create newCalendar

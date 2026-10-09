@@ -1,0 +1,76 @@
+-- | Crown.Identity
+-- Party identity, onboarding, and user-to-party mapping.
+-- Architecture §4.1, §10.2, §12.1
+module Identity where
+
+import DA.Time (Time)
+
+-- ---------------------------------------------------------------------------
+-- PartyOnboarding
+-- ---------------------------------------------------------------------------
+
+-- | `PartyOnboarding` — records that a legal entity has been onboarded to
+-- CROWN with an approved product scope and the corresponding Daml party
+-- identity. The CROWN operator is the signatory.
+--
+-- Architecture §4.1, §10.2: bind authenticated users to the correct Daml
+-- party. Operator must not grant excessive product scope.
+template PartyOnboarding
+  with
+    onboardingId    : Text
+    operator        : Party        -- CROWN operator administers onboarding
+    legalEntity     : Text         -- LEI of the institution
+    damlParty       : Party        -- the Daml party being onboarded
+    productScope    : [Text]       -- e.g. ["BilateralRepo", "TriPartyRepo"]
+    kycStatus       : Text         -- "Approved" | "PendingReview" | "Suspended"
+    kycRef          : Text         -- reference to external KYC/AML system record
+    onboardedAt     : Time
+    reviewedBy      : Text         -- name or identifier of approving officer
+  where
+    signatory operator
+    observer damlParty
+
+    ensure
+      legalEntity /= ""
+      && kycRef /= ""
+      && (not (null productScope))
+
+    -- | Update the product scope (e.g. adding a new product).
+    choice UpdateProductScope : ContractId PartyOnboarding
+      with newScope : [Text]
+      controller operator
+      do
+        assertMsg "New product scope must not be empty"
+          (not (null newScope))
+        create this with productScope = newScope
+
+    -- | Suspend the party (e.g. KYC review triggered).
+    choice SuspendParty : ContractId PartyOnboarding
+      with reason : Text
+      controller operator
+      do
+        create this with kycStatus = "Suspended"
+
+    -- | Reinstate the party after a successful re-review.
+    choice ReinstateParty : ContractId PartyOnboarding
+      with newKycRef : Text
+      controller operator
+      do
+        assertMsg "KYC reference must be provided"
+          (newKycRef /= "")
+        create this with
+          kycStatus = "Approved"
+          kycRef    = newKycRef
+
+-- ---------------------------------------------------------------------------
+-- PartyIdentity record (lightweight reference in other contracts)
+-- ---------------------------------------------------------------------------
+
+-- | Lightweight party identity record referenced from other contracts.
+-- Not a contract itself to avoid unnecessary ledger overhead.
+data PartyIdentity = PartyIdentity
+  with
+    legalEntity  : Text            -- LEI
+    damlParty    : Party
+    productScope : [Text]
+  deriving (Eq, Show)

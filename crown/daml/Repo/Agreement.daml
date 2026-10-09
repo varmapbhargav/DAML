@@ -1,0 +1,200 @@
+-- | Crown.Repo.Agreement
+-- Bilateral repo proposal and accepted agreement templates.
+-- Implements the full lifecycle state machine from Architecture §5.4 and
+-- the choice design matrix from Architecture §5.5.
+module Repo.Agreement where
+
+import Types
+-- Date and Time are in the Daml prelude; no explicit import needed.
+
+-- ---------------------------------------------------------------------------
+-- RepoProposal
+-- ---------------------------------------------------------------------------
+
+-- | `RepoProposal` — one party proposes repo terms to a counterparty.
+-- The proposer is the sole signatory; the counterparty is an observer so
+-- the proposal is visible to them. Separation of proposal from acceptance
+-- enforces explicit consent (Architecture §5.1 principle 6).
+template RepoProposal
+  with
+    proposalId       : Text            -- stable business identifier
+    proposer         : Party           -- cash borrower (creates the proposal)
+    counterparty     : Party           -- cash provider (must accept/reject)
+    terms            : RepoTerms       -- full economic terms (Architecture §6.1)
+    proposedAt       : Time
+    expiresAt        : Optional Time   -- wall-clock expiry; enforcement is external
+    idempotencyKey   : Text            -- prevents duplicate proposal creation
+  where
+    signatory proposer
+    observer counterparty
+
+    ensure
+      terms.principal > 0.0
+      && terms.repurchaseAmount >= terms.principal
+      && terms.haircut >= 0.0 && terms.haircut < 1.0
+      && terms.maturityDate > terms.openingValueDate
+      && terms.openingValueDate >= terms.tradeDate
+
+    -- | Counterparty accepts → creates a binding RepoAgreement.
+    -- Architecture §5.5: controller = proposed counterparty.
+    choice Accept : ContractId RepoAgreement
+      controller counterparty
+      do
+        now <- getTime
+        create RepoAgreement
+          with
+            agreementId    = proposalId
+            borrower       = proposer
+            cashProvider   = counterparty
+            terms          = terms
+            status         = Accepted
+            createdAt      = now
+            activatedAt    = None
+            closedAt       = None
+
+    -- | Counterparty rejects → archives proposal; no new contract.
+    -- Architecture §5.5: controller = proposed counterparty.
+    choice Reject : ()
+      controller counterparty
+      do
+        return ()
+
+    -- | Proposer cancels before acceptance.
+    -- Architecture §5.5: controller = proposer.
+    choice Cancel : ()
+      controller proposer
+      do
+        return ()
+
+-- ---------------------------------------------------------------------------
+-- RepoAgreement
+-- ---------------------------------------------------------------------------
+
+-- | `RepoAgreement` — accepted repo agreement with full lifecycle choices.
+-- Both parties are signatories, enforcing mutual consent for state changes.
+-- Status transitions implement the state machine in Architecture §5.4.
+template RepoAgreement
+  with
+    agreementId  : Text
+    borrower     : Party           -- cash borrower / security seller
+    cashProvider : Party           -- cash provider / security buyer
+    terms        : RepoTerms
+    status       : AgreementStatus -- narrow enum, not a free-form string
+    createdAt    : Time
+    activatedAt  : Optional Time
+    closedAt     : Optional Time
+  where
+    signatory borrower, cashProvider
+
+    ensure
+      terms.principal > 0.0
+      && terms.repurchaseAmount >= terms.principal
+      && terms.haircut >= 0.0 && terms.haircut < 1.0
+      && terms.maturityDate > terms.openingValueDate
+      && (status /= Closed || closedAt /= None)
+
+    -- | Request opening settlement instruction.
+    -- Architecture §5.5: authorized workflow role (both parties here).
+    choice RequestOpeningSettlement : (ContractId RepoAgreement, ContractId OpeningSettlementRequest)
+      with settlementSystemId : Text
+      controller borrower, cashProvider
+      do
+        assertMsg "Agreement must be in Accepted status to request opening settlement"
+          (status == Accepted)
+        assertMsg "Settlement system must be provided"
+          (settlementSystemId /= "")
+        now <- getTime
+        newAgreement <- create this with status = Active
+        settlementReq <- create OpeningSettlementRequest
+          with
+            agreementId      = agreementId
+            borrower         = borrower
+            cashProvider     = cashProvider
+            principal        = terms.principal
+            currency         = terms.currency
+            settlementSystem = settlementSystemId
+            requestedAt      = now
+            idempotencyKey   = agreementId <> "-opening-v" <> show terms.termsVersion
+        return (newAgreement, settlementReq)
+
+    -- | Authorize early termination.
+    -- Architecture §5.5: mutually authorized by both parties.
+    choice RequestTermination : ContractId RepoAgreement
+      with reason : Text
+      controller borrower, cashProvider
+      do
+        assertMsg "Only active agreements may be terminated early"
+          (status == Active)
+        assertMsg "Termination reason must be provided"
+          (reason /= "")
+        create this with status = TerminationPending
+
+    -- | Trigger maturity workflow when maturity date is reached.
+    -- Architecture §7.4: authorized lifecycle actor must submit this choice.
+    choice TriggerMaturity : ContractId RepoAgreement
+      controller borrower, cashProvider
+      do
+        assertMsg "Only active agreements may enter maturity workflow"
+          (status == Active)
+        create this with status = MaturityPending
+
+    -- | Record a default event (authorized workflow only).
+    -- Architecture §5.4: DefaultWorkflow state.
+    choice RecordDefaultEvent : ContractId RepoAgreement
+      with defaultReason : Text
+      controller borrower, cashProvider
+      do
+        assertMsg "Default may only be recorded on an active agreement"
+          (status == Active || status == MaturityPending)
+        create this with status = DefaultWorkflow
+
+    -- | Confirm closure once all settlement evidence is validated.
+    -- Architecture §5.5: required payment and asset-return evidence must exist.
+    choice ConfirmClosure : ContractId RepoAgreement
+      with closingEvidenceRef : Text
+      controller borrower, cashProvider
+      do
+        assertMsg "Agreement must be in MaturityPending or TerminationPending to close"
+          (status == MaturityPending || status == TerminationPending || status == DefaultWorkflow)
+        assertMsg "Closing evidence reference must be provided"
+          (closingEvidenceRef /= "")
+        now <- getTime
+        create this with
+          status   = Closed
+          closedAt = Some now
+
+-- ---------------------------------------------------------------------------
+-- OpeningSettlementRequest (helper contract)
+-- ---------------------------------------------------------------------------
+
+-- | Tracks an instruction to initiate opening settlement.
+-- Consumed by the settlement adapter to create a SettlementInstruction.
+template OpeningSettlementRequest
+  with
+    agreementId      : Text
+    borrower         : Party
+    cashProvider     : Party
+    principal        : Decimal
+    currency         : Text
+    settlementSystem : Text
+    requestedAt      : Time
+    idempotencyKey   : Text            -- must be stable across retries
+  where
+    signatory borrower, cashProvider
+
+    ensure
+      principal > 0.0
+      && idempotencyKey /= ""
+
+    -- | Adapter acknowledges and creates a SettlementInstruction in the Settlement module.
+    -- (Actual Settlement contract creation is done by the workflow orchestrator)
+    choice AcknowledgeSettlementRequest : ()
+      controller borrower, cashProvider
+      do
+        return ()
+
+    -- | Cancel the opening settlement request (e.g. if pre-checks fail).
+    choice CancelSettlementRequest : ()
+      controller borrower, cashProvider
+      do
+        return ()

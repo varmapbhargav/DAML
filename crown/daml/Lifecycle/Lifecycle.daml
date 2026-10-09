@@ -1,0 +1,98 @@
+-- | Crown.Lifecycle
+-- Maturity obligation and termination record templates.
+-- Architecture §5.3, §5.4, §7.4
+module Lifecycle where
+
+import Types
+import DA.Date (Date)
+import DA.Time (Time)
+
+-- ---------------------------------------------------------------------------
+-- MaturityObligation
+-- ---------------------------------------------------------------------------
+
+-- | `MaturityObligation` — records the repurchase amount and collateral-return
+-- obligations due at maturity. Created from an active RepoAgreement when the
+-- maturity workflow is triggered.
+--
+-- Architecture §7.4: idempotent; a maturity scheduler must not create
+-- duplicate obligations. Both parties are signatories.
+template MaturityObligation
+  with
+    obligationId         : Text            -- stable idempotency identifier
+    agreementId          : Text            -- parent RepoAgreement
+    borrower             : Party
+    cashProvider         : Party
+    repurchaseAmount     : Decimal         -- cash amount the borrower owes
+    repurchaseCurrency   : Text            -- ISO 4217
+    dueDate              : Date
+    collateralReturnRef  : Text            -- reference to CollateralAllocation
+    status               : Text            -- "Open" | "ClosingSettlementRequested" | "Closed"
+    createdAt            : Time
+    closingInstructionRef: Optional Text   -- set when closing settlement is requested
+  where
+    signatory borrower, cashProvider
+
+    ensure
+      repurchaseAmount > 0.0
+      && obligationId /= ""
+
+    -- | Request closing settlement instruction for maturity.
+    -- Architecture §5.5: RequestMaturitySettlement — authorized lifecycle actor.
+    choice RequestMaturitySettlement : ContractId MaturityObligation
+      with
+        settlementSystemId : Text
+        idempotencyKey     : Text
+      controller borrower, cashProvider
+      do
+        assertMsg "Obligation must be Open to request closing settlement"
+          (status == "Open")
+        assertMsg "Idempotency key must be provided"
+          (idempotencyKey /= "")
+        create this with
+          status               = "ClosingSettlementRequested"
+          closingInstructionRef= Some idempotencyKey
+
+    -- | Mark the obligation as closed after all evidence is validated.
+    -- Architecture §5.5: ConfirmClosure — required evidence must be available.
+    choice CloseObligation : ()
+      with closingEvidenceRef : Text
+      controller borrower, cashProvider
+      do
+        assertMsg "Only ClosingSettlementRequested obligations may be closed"
+          (status == "ClosingSettlementRequested")
+        assertMsg "Closing evidence must be provided"
+          (closingEvidenceRef /= "")
+        return ()
+
+-- ---------------------------------------------------------------------------
+-- TerminationRecord
+-- ---------------------------------------------------------------------------
+
+-- | `TerminationRecord` — evidence of completed or agreed early termination.
+-- Created when both parties have confirmed close-out conditions are satisfied.
+-- Architecture §5.3: captures reason, authorized parties, and timestamp.
+template TerminationRecord
+  with
+    recordId         : Text
+    agreementId      : Text
+    borrower         : Party
+    cashProvider     : Party
+    terminationType  : Text     -- "EarlyTermination" | "Default" | "Maturity"
+    reason           : Text
+    closingEvidenceRefs : [Text] -- references to SettlementEvidence contracts
+    recordedAt       : Time
+    authorizedBy     : [Party]  -- parties that authorized the termination
+  where
+    signatory borrower, cashProvider
+
+    ensure
+      recordId /= ""
+      && reason /= ""
+      && (not (null closingEvidenceRefs))
+
+    -- | Acknowledge the termination record (for audit purposes).
+    choice AcknowledgeTermination : ()
+      controller borrower, cashProvider
+      do
+        return ()

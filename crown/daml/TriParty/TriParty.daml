@@ -1,0 +1,125 @@
+-- | Crown.TriParty
+-- Agent mandate and allocation request for tri-party repo workflows.
+-- Architecture §5.3, §11.1
+module TriParty where
+
+import Types
+import DA.Time (Time)
+import DA.Date (Date)
+
+-- ---------------------------------------------------------------------------
+-- AgentMandate
+-- ---------------------------------------------------------------------------
+
+-- | `AgentMandate` — defines the authority and constraints under which
+-- a tri-party agent may allocate and manage collateral on behalf of the
+-- counterparties.
+--
+-- Architecture §11.1: the agent may allocate collateral only within its
+-- mandate. Trade economics remain controlled by counterparties.
+template AgentMandate
+  with
+    mandateId               : Text
+    agreementId             : Text          -- scoped to a specific repo agreement
+    agent                   : Party         -- tri-party agent (signatory and controller)
+    borrower                : Party         -- signatory: must agree to the mandate
+    cashProvider            : Party         -- signatory: must agree to the mandate
+    eligibleAssetClasses    : [AssetClass]
+    allowedCurrencies       : [Text]
+    haircut                 : Decimal       -- agent-applied haircut floor
+    maxConcentration        : Decimal       -- concentration limit per issuer/class
+    eligibilityPolicyId     : Text          -- references EligibilityPolicy contract
+    valuationSource         : Text          -- e.g. "AgentPriceFeed", "CCILPriceService"
+    valuationFrequencyMinutes: Int
+    allocationAuthority     : Bool          -- agent may allocate without explicit approval
+    substitutionAuthority   : Bool          -- agent may substitute without explicit approval
+    feeBasisPoints          : Int           -- agent fee in basis points
+    operationalCutOffTime   : Text          -- ISO 8601 time string
+    exceptionRoutingParty   : Optional Party
+    mandateVersion          : Int
+    effectiveDate           : Date
+    expiresAt               : Optional Time
+  where
+    signatory agent, borrower, cashProvider
+
+    ensure
+      haircut >= 0.0 && haircut < 1.0
+      && maxConcentration > 0.0 && maxConcentration <= 1.0
+      && valuationFrequencyMinutes > 0
+      && feeBasisPoints >= 0
+      && mandateVersion >= 1
+
+    -- | Propose a new version of the mandate (e.g. updated haircuts).
+    choice AmendMandate : ContractId AgentMandate
+      with newMandate : AgentMandate
+      controller agent, borrower, cashProvider
+      do
+        assertMsg "New mandate version must be strictly greater"
+          (newMandate.mandateVersion > mandateVersion)
+        create newMandate
+
+    -- | Terminate the mandate; no further agent allocations permitted.
+    choice TerminateMandate : ()
+      with terminationReason : Text
+      controller borrower, cashProvider
+      do
+        assertMsg "Termination reason must be provided"
+          (terminationReason /= "")
+        return ()
+
+-- ---------------------------------------------------------------------------
+-- AllocationRequest
+-- ---------------------------------------------------------------------------
+
+-- | `AllocationRequest` — agent-proposed collateral allocation under a mandate.
+-- The agent proposes; counterparties approve (unless allocationAuthority is True,
+-- in which case the agent may commit directly via workflow rules).
+template AllocationRequest
+  with
+    requestId        : Text
+    mandateId        : Text                -- references the AgentMandate
+    agreementId      : Text
+    agent            : Party
+    borrower         : Party
+    cashProvider     : Party
+    proposedLines    : [CollateralLine]    -- proposed collateral lines from Types
+    totalMarketValue : Decimal
+    coverageRatio    : Decimal
+    requestedAt      : Time
+    status           : Text               -- "Pending" | "Approved" | "Rejected" | "Superseded"
+    idempotencyKey   : Text
+  where
+    signatory agent
+    observer borrower, cashProvider
+
+    ensure
+      totalMarketValue > 0.0
+      && coverageRatio > 0.0
+      && (not (null proposedLines))
+      && idempotencyKey /= ""
+
+    -- | Cash provider approves the proposed allocation.
+    choice ApproveAllocationRequest : ContractId AllocationRequest
+      controller cashProvider
+      do
+        assertMsg "Request must be Pending to be approved"
+          (status == "Pending")
+        create this with status = "Approved"
+
+    -- | Cash provider rejects the proposed allocation.
+    choice RejectAllocationRequest : ContractId AllocationRequest
+      with rejectionReason : Text
+      controller cashProvider
+      do
+        assertMsg "Request must be Pending to be rejected"
+          (status == "Pending")
+        create this with status = "Rejected"
+
+    -- | Agent supersedes this request with a new one.
+    choice SupersedeAllocationRequest : ContractId AllocationRequest
+      with newRequestId : Text
+      controller agent
+      do
+        assertMsg "Request must be Pending to be superseded"
+          (status == "Pending")
+        create this with status = "Superseded"

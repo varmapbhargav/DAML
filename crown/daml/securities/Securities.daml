@@ -1,0 +1,89 @@
+-- | Crown.Securities
+-- Securities position and custody evidence.
+-- Architecture §6.2, §8.4, §9.4
+module Securities where
+
+import Types (AssetClass, CollateralStatus)
+import DA.Time (Time)
+import DA.Date (Date)
+
+-- ---------------------------------------------------------------------------
+-- SecurityPosition record
+-- ---------------------------------------------------------------------------
+
+-- | Describes a securities position considered for collateral.
+-- An asset identifier in a contract does NOT by itself prove ownership,
+-- custody, absence of encumbrances, or legal perfection (Architecture §6.2).
+data SecurityPosition = SecurityPosition
+  with
+    instrumentId        : Text              -- ISIN or controlled identifier
+    quantity            : Decimal           -- nominal amount or share count
+    instrumentCurrency  : Text              -- denomination currency
+    settlementLocation  : Text              -- custody account or CSD location
+    isEligible          : Bool              -- under the current EligibilityPolicy
+    assetClass          : AssetClass
+    remainingMaturityDays : Int             -- as of last eligibility check
+    custodyAccountRef   : Optional Text
+  deriving (Eq, Show)
+
+-- ---------------------------------------------------------------------------
+-- CustodyConfirmation (contract)
+-- ---------------------------------------------------------------------------
+
+-- | `CustodyConfirmation` — records a custodian's confirmation of asset
+-- presence and availability for a specific repo agreement.
+-- Architecture §8.4: custody or collateral-management system as source of
+-- truth with authenticated confirmations and reconciliation.
+template CustodyConfirmation
+  with
+    confirmationId   : Text
+    agreementId      : Text
+    custodian        : Party              -- custodian/CSD party (signatory)
+    borrower         : Party             -- owner/pledgor (signatory)
+    cashProvider     : Party             -- observer (beneficiary of confirmation)
+    instrumentId     : Text
+    quantity         : Decimal
+    custodyAccount   : Text
+    availableQuantity: Decimal           -- unencumbered quantity at the time of confirmation
+    confirmedAt      : Time
+    freshnessLimitMin: Int               -- how long this confirmation is considered valid
+    evidenceDigest   : Text             -- hash of the custodian's confirmation document
+    status           : CollateralStatus  -- AllocationProposed | Allocated | Released
+  where
+    signatory custodian, borrower
+    observer cashProvider
+
+    ensure
+      quantity > 0.0
+      && availableQuantity >= 0.0
+      && availableQuantity <= quantity
+      && evidenceDigest /= ""
+      && freshnessLimitMin > 0
+
+    -- | Custodian updates an existing confirmation (e.g. after a position change).
+    choice RefreshConfirmation : ContractId CustodyConfirmation
+      with
+        newAvailableQuantity : Decimal
+        newEvidenceDigest    : Text
+      controller custodian, borrower
+      do
+        assertMsg "Refreshed quantity must be non-negative"
+          (newAvailableQuantity >= 0.0)
+        assertMsg "New evidence digest must be provided"
+          (newEvidenceDigest /= "")
+        now <- getTime
+        create this with
+          availableQuantity = newAvailableQuantity
+          evidenceDigest    = newEvidenceDigest
+          confirmedAt       = now
+
+    -- | Release the custodial hold after repo closure.
+    choice ReleaseFromHold : ()
+      with releaseEvidenceRef : Text
+      controller custodian, borrower
+      do
+        assertMsg "Only Allocated positions may be released"
+          (status == Allocated)
+        assertMsg "Release evidence must be provided"
+          (releaseEvidenceRef /= "")
+        return ()

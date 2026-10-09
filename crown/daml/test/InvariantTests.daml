@@ -1,0 +1,189 @@
+module InvariantTests where
+
+import Daml.Script
+import Repo.Agreement
+import Settlement
+import Types
+
+validTerms : Party -> RepoTerms
+validTerms approver =
+  RepoTerms with
+    productType = "BilateralRepo"
+    marketConventionId = "M-0001"
+    principal = 1000000.00
+    currency = "USD"
+    repoRate = 0.05
+    rateType = Fixed
+    dayCountConvention = Actual360
+    tradeDate = date 2026 Jan 1
+    openingValueDate = date 2026 Jan 2
+    maturityDate = date 2026 Jan 9
+    applicableCalendar = "TARGET"
+    repurchaseAmount = 1005000.00
+    collateralBasketId = None
+    eligibleAssetClasses = [GovernmentBond]
+    collateralCurrency = "USD"
+    haircut = 0.02
+    concentrationLimit = 0.20
+    marginFrequencyDays = 0
+    marginThreshold = 0.01
+    minimumTransferAmount = 100.00
+    disputeWindowHours = 24
+    settlementSystemId = "CCIL"
+    settlementCutOffTime = "14:30:00Z"
+    masterAgreementRef = "GMRA-2011"
+    legalEntityIdBorrower = "LEI-BORROWER"
+    legalEntityIdProvider = "LEI-LENDER"
+    termsVersion = 1
+    approvedBy = approver
+
+-- A closed agreement is invalid unless it includes a close timestamp.
+testClosedAgreementRequiresCloseTimestamp : Script ()
+testClosedAgreementRequiresCloseTimestamp = do
+  borrower <- allocateParty "Borrower"
+  cashProvider <- allocateParty "CashProvider"
+  now <- getTime
+
+  submitMustFailMulti [borrower, cashProvider] [] do
+    createCmd RepoAgreement with
+      agreementId = "agreement-closed-invalid"
+      borrower = borrower
+      cashProvider = cashProvider
+      terms = validTerms borrower
+      status = Closed
+      createdAt = now
+      activatedAt = None
+      closedAt = None
+
+  pure ()
+
+-- A proposal with non-positive principal violates the business invariant.
+testProposalRejectsZeroPrincipal : Script ()
+testProposalRejectsZeroPrincipal = do
+  borrower <- allocateParty "Borrower"
+  counterparty <- allocateParty "Counterparty"
+  now <- getTime
+
+  submitMustFail borrower do
+    createCmd RepoProposal with
+      proposalId = "proposal-zero-principal"
+      proposer = borrower
+      counterparty = counterparty
+      terms = validTerms borrower with principal = 0.0
+      proposedAt = now
+      expiresAt = None
+      idempotencyKey = "proposal-zero-principal-1"
+
+  pure ()
+
+-- A repository can only request opening settlement after it is accepted.
+testOpeningSettlementRequiresAcceptedState : Script ()
+testOpeningSettlementRequiresAcceptedState = do
+  borrower <- allocateParty "Borrower"
+  cashProvider <- allocateParty "CashProvider"
+  now <- getTime
+
+  agreement <- submitMulti [borrower, cashProvider] [] do
+    createCmd RepoAgreement with
+      agreementId = "agreement-not-accepted"
+      borrower = borrower
+      cashProvider = cashProvider
+      terms = validTerms borrower
+      status = Proposed
+      createdAt = now
+      activatedAt = None
+      closedAt = None
+
+  submitMustFailMulti [borrower, cashProvider] [] do
+    exerciseCmd agreement RequestOpeningSettlement with
+      settlementSystemId = "CCIL"
+
+  pure ()
+
+-- Closing a repo without evidence reference violates the closure invariant.
+testClosureRequiresEvidenceReference : Script ()
+testClosureRequiresEvidenceReference = do
+  borrower <- allocateParty "Borrower"
+  cashProvider <- allocateParty "CashProvider"
+  now <- getTime
+
+  agreement <- submitMulti [borrower, cashProvider] [] do
+    createCmd RepoAgreement with
+      agreementId = "agreement-close-invalid"
+      borrower = borrower
+      cashProvider = cashProvider
+      terms = validTerms borrower
+      status = MaturityPending
+      createdAt = now
+      activatedAt = Some now
+      closedAt = None
+
+  submitMustFailMulti [borrower, cashProvider] [] do
+    exerciseCmd agreement ConfirmClosure with
+      closingEvidenceRef = ""
+
+  pure ()
+
+-- Settlement instructions must carry a non-empty idempotency key and a positive amount.
+testSettlementInstructionRejectsBlankIdempotency : Script ()
+testSettlementInstructionRejectsBlankIdempotency = do
+  borrower <- allocateParty "Borrower"
+  cashProvider <- allocateParty "CashProvider"
+  settlementRole <- allocateParty "SettlementAgent"
+  now <- getTime
+
+  submitMustFail borrower do
+    createCmd SettlementInstruction with
+      instructionId = "instruction-invalid-idem"
+      agreementId = "agreement-001"
+      borrower = borrower
+      cashProvider = cashProvider
+      settlementRole = settlementRole
+      legType = CashLeg
+      amount = 100.00
+      currency = "USD"
+      instrumentId = None
+      debitAccount = "DEBIT-001"
+      creditAccount = "CREDIT-001"
+      settlementSystem = "CCIL"
+      valueDate = "2026-01-02"
+      status = Prepared
+      idempotencyKey = ""
+      requestedAt = now
+      externalRef = None
+
+  pure ()
+
+-- Settlement instructions may not be cancelled unless they are still in Prepared state.
+testSettlementCancellationRequiresPreparedState : Script ()
+testSettlementCancellationRequiresPreparedState = do
+  borrower <- allocateParty "Borrower"
+  cashProvider <- allocateParty "CashProvider"
+  settlementRole <- allocateParty "SettlementAgent"
+  now <- getTime
+
+  instruction <- submit borrower do
+    createCmd SettlementInstruction with
+      instructionId = "instruction-cancel-invalid"
+      agreementId = "agreement-002"
+      borrower = borrower
+      cashProvider = cashProvider
+      settlementRole = settlementRole
+      legType = CashLeg
+      amount = 100.00
+      currency = "USD"
+      instrumentId = None
+      debitAccount = "DEBIT-001"
+      creditAccount = "CREDIT-001"
+      settlementSystem = "CCIL"
+      valueDate = "2026-01-02"
+      status = Submitted
+      idempotencyKey = "instruction-cancel-invalid-1"
+      requestedAt = now
+      externalRef = Some "EXT-001"
+
+  submitMustFailMulti [borrower, cashProvider] [] do
+    exerciseCmd instruction CancelInstruction with
+      cancellationRef = "CANCEL-001"
+
+  pure ()

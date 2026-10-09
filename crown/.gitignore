@@ -1,0 +1,18 @@
+
+# Daml build artifacts
+/.daml/
+build/
+
+# Node.js dependencies
+node_modules/
+
+# Logs
+*.log
+
+# Generated files
+ui/daml.js
+
+# Environment secrets
+.env
+.env.*
+!.env.example

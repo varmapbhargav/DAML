@@ -1,0 +1,78 @@
+module ProposalValidation where
+
+import Daml.Script
+import Repo.Agreement
+import Types
+
+validTerms : Party -> RepoTerms
+validTerms approver =
+  RepoTerms with
+    productType = "BilateralRepo"
+    marketConventionId = "M-0001"
+    principal = 1000000.00
+    currency = "USD"
+    repoRate = 0.05
+    rateType = Fixed
+    dayCountConvention = Actual360
+    tradeDate = date 2026 Jan 1
+    openingValueDate = date 2026 Jan 2
+    maturityDate = date 2026 Jan 9
+    applicableCalendar = "TARGET"
+    repurchaseAmount = 1005000.00
+    collateralBasketId = None
+    eligibleAssetClasses = [GovernmentBond]
+    collateralCurrency = "USD"
+    haircut = 0.02
+    concentrationLimit = 0.20
+    marginFrequencyDays = 0
+    marginThreshold = 0.01
+    minimumTransferAmount = 100.00
+    disputeWindowHours = 24
+    settlementSystemId = "CCIL"
+    settlementCutOffTime = "14:30:00Z"
+    masterAgreementRef = "GMRA-2011"
+    legalEntityIdBorrower = "LEI-BORROWER"
+    legalEntityIdProvider = "LEI-LENDER"
+    termsVersion = 1
+    approvedBy = approver
+
+-- Valid proposal can be accepted by the counterparty.
+testProposalAcceptance : Script ()
+testProposalAcceptance = do
+  borrower <- allocateParty "Borrower"
+  cashProvider <- allocateParty "CashProvider"
+  now <- getTime
+
+  proposal <- submit borrower do
+    createCmd RepoProposal with
+      proposalId = "repo-validation-001"
+      proposer = borrower
+      counterparty = cashProvider
+      terms = validTerms borrower
+      proposedAt = now
+      expiresAt = None
+      idempotencyKey = "repo-validation-001-1"
+
+  _ <- submit cashProvider do
+    exerciseCmd proposal Accept
+
+  pure ()
+
+-- Invalid terms are rejected before a proposal can be accepted.
+testProposalRejectsInvalidPrincipal : Script ()
+testProposalRejectsInvalidPrincipal = do
+  borrower <- allocateParty "Borrower"
+  cashProvider <- allocateParty "CashProvider"
+  now <- getTime
+
+  submitMustFail borrower do
+    createCmd RepoProposal with
+      proposalId = "repo-invalid-001"
+      proposer = borrower
+      counterparty = cashProvider
+      terms = validTerms borrower with principal = 0.0
+      proposedAt = now
+      expiresAt = None
+      idempotencyKey = "repo-invalid-001-1"
+
+  pure ()

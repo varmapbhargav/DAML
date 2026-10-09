@@ -1,0 +1,129 @@
+-- | Crown.Margin
+-- Margin call, dispute, and satisfaction workflow.
+-- Architecture §5.3, §5.5, §6.4, §8.2
+module Margin where
+
+import Types
+import DA.Time (Time)
+
+-- ---------------------------------------------------------------------------
+-- MarginCall
+-- ---------------------------------------------------------------------------
+
+-- | `MarginCall` — raised when the collateral coverage falls below the
+-- required threshold. The authorized risk service party (riskService) creates
+-- this contract; both counterparties can see and respond to it.
+--
+-- Architecture §8.2: margin calls must be calculated from trusted, fresh
+-- inputs and the contractual margin method.
+template MarginCall
+  with
+    callId            : Text          -- stable identifier for this call
+    agreementId       : Text          -- scoped to a specific RepoAgreement
+    borrower          : Party         -- owes margin / can satisfy or dispute
+    cashProvider      : Party         -- raised the call / observes satisfaction
+    riskService       : Party         -- authorized risk service that created the call
+    amount            : Decimal       -- net margin amount due
+    currency          : Text          -- ISO 4217
+    marginType        : Text          -- "VariationMargin" | "InitialMargin" | "CashMargin"
+    reason            : Text          -- brief description of the deficit
+    valuationSnapshotRef : Text       -- references the ValuationSnapshot used
+    dueAt             : Time          -- when the call must be satisfied
+    status            : MarginStatus
+    disputeWindowEnd  : Time          -- deadline for raising a dispute
+    createdAt         : Time
+  where
+    signatory riskService, cashProvider
+    observer borrower
+
+    ensure
+      amount > 0.0
+      && dueAt > createdAt
+      && disputeWindowEnd > createdAt
+
+    -- | Borrower disputes the margin call within the dispute window.
+    -- Architecture §5.5: controller = receiving party (borrower).
+    choice DisputeMarginCall : ContractId MarginCall
+      with
+        disputeRef   : Text   -- reference to borrower's supporting data
+        disputeReason: Text
+      controller borrower
+      do
+        assertMsg "Margin call must be Open to be disputed"
+          (status == Open)
+        assertMsg "Dispute reason must be provided"
+          (disputeReason /= "")
+        now <- getTime
+        assertMsg "Dispute must be raised within the dispute window"
+          (now <= disputeWindowEnd)
+        create this with status = Disputed
+
+    -- | Record that the margin call has been partially satisfied.
+    -- Allows progressive satisfaction tracking.
+    choice PartiallyFulfill : ContractId MarginCall
+      with
+        partialAmount    : Decimal
+        evidenceRef      : Text
+      controller borrower, cashProvider
+      do
+        assertMsg "Margin call must be Open to be partially satisfied"
+          (status == Open)
+        assertMsg "Partial amount must be positive and less than total amount"
+          (partialAmount > 0.0 && partialAmount < amount)
+        assertMsg "Evidence reference must be provided"
+          (evidenceRef /= "")
+        create this with
+          status = PartiallySatisfied
+          amount = amount - partialAmount
+
+    -- | Mark the margin call as fully satisfied.
+    -- Architecture §5.5: controller = authorized settlement workflow.
+    choice SatisfyMarginCall : ()
+      with
+        evidenceRef : Text    -- reference to verified settlement evidence
+      controller borrower, cashProvider
+      do
+        assertMsg "Only Open or Disputed margin calls may be satisfied"
+          (status == Open || status == Disputed || status == PartiallySatisfied)
+        assertMsg "Evidence reference must be provided before satisfying"
+          (evidenceRef /= "")
+        return ()
+
+    -- | Cancel the margin call (e.g. if valuation dispute is resolved in borrower's favor).
+    choice CancelMarginCall : ()
+      with cancellationReason : Text
+      controller riskService, cashProvider
+      do
+        assertMsg "Only Open or Disputed calls may be cancelled"
+          (status == Open || status == Disputed)
+        return ()
+
+    -- | Record expiry of the margin call if due date passes without action.
+    choice ExpireMarginCall : ()
+      controller riskService, cashProvider
+      do
+        assertMsg "Only Open or Disputed calls may be expired"
+          (status == Open || status == Disputed)
+        return ()
+
+    -- | Record resolution outcome after a dispute is resolved by operations.
+    -- Architecture §8.2: operations records the resolution.
+    choice ResolveDispute : ContractId MarginCall
+      with
+        resolutionOutcome : Text    -- "BorrowerCorrect" | "ProviderCorrect" | "Agreed"
+        resolvedAmount    : Decimal
+        resolutionRef     : Text
+      controller riskService, cashProvider
+      do
+        assertMsg "Only Disputed calls may be resolved"
+          (status == Disputed)
+        assertMsg "Resolved amount must be non-negative"
+          (resolvedAmount >= 0.0)
+        if resolvedAmount == 0.0
+          then do
+            return (error "Use CancelMarginCall if amount is zero")
+          else do
+            now <- getTime
+            create this with
+              amount = resolvedAmount
+              status = Open

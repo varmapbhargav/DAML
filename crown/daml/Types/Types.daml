@@ -1,0 +1,174 @@
+-- | Crown.Types
+-- Core shared types, enumerations, and domain records for the CROWN platform.
+-- All modules import from here; do NOT import other Crown modules from this module
+-- to avoid circular dependencies.
+module Types where
+
+-- Date and Time are in the Daml prelude; no explicit import needed.
+
+-- ---------------------------------------------------------------------------
+-- § 6.4  Status enumerations
+-- ---------------------------------------------------------------------------
+
+-- | Agreement / repo lifecycle state.
+-- Maps directly to the state machine in Architecture §5.4.
+data AgreementStatus
+  = Proposed
+  | Accepted
+  | Rejected
+  | Cancelled
+  | Active
+  | MaturityPending
+  | TerminationPending
+  | DefaultWorkflow
+  | Closed
+  deriving (Eq, Show)
+
+-- | External settlement instruction status.
+-- Independent of repo status per Architecture §9.3.
+data SettlementStatus
+  = Prepared
+  | Submitted
+  | Acknowledged
+  | SettlementPending
+  | Settled
+  | SettlementFailed
+  | SettlementCancelled
+  | ReconciliationRequired
+  deriving (Eq, Show)
+
+-- | Margin call status per Architecture §6.4.
+data MarginStatus
+  = Open
+  | Disputed
+  | PartiallySatisfied
+  | Satisfied
+  | Expired
+  | MarginCancelled
+  deriving (Eq, Show)
+
+-- | Collateral allocation status per Architecture §6.4.
+data CollateralStatus
+  = AllocationProposed
+  | Allocated
+  | SubstitutionPending
+  | Released
+  | CollateralReconciliationRequired
+  deriving (Eq, Show)
+
+-- | Settlement instruction type (cash or securities leg).
+data LegType
+  = CashLeg
+  | SecuritiesLeg
+  deriving (Eq, Show)
+
+-- | Eligible asset class for collateral eligibility policy.
+data AssetClass
+  = GovernmentBond
+  | CorporateBond
+  | EquityShare
+  | MoneyMarketInstrument
+  | CoveredBond
+  | AgencyBond
+  deriving (Eq, Show)
+
+-- | Rate type for the repo rate convention.
+data RateType
+  = Fixed
+  | Floating
+  | OverNightIndexSwap
+  deriving (Eq, Show)
+
+-- | Day-count convention for interest/repurchase calculations.
+data DayCountConvention
+  = Actual360
+  | Actual365Fixed
+  | ActualActual
+  | Thirty360
+  deriving (Eq, Show)
+
+-- ---------------------------------------------------------------------------
+-- § 6.1  Repo terms record
+-- ---------------------------------------------------------------------------
+
+-- | `RepoTerms` - full economic description of a repo transaction.
+-- Must be deterministic: repurchase amount is derivable from these fields.
+-- Monetary amounts use Decimal with the expectation that the application
+-- layer enforces the agreed precision and rounding policy.
+data RepoTerms = RepoTerms
+  with
+    -- Product identity
+    productType          : Text            -- e.g. "BilateralRepo", "TriPartyRepo"
+    marketConventionId   : Text            -- reference to a governed convention record
+    -- Economic terms
+    principal            : Decimal         -- cash principal
+    currency             : Text            -- ISO 4217 currency code
+    repoRate             : Decimal         -- annualised rate, e.g. 0.0425 for 4.25%
+    rateType             : RateType
+    dayCountConvention   : DayCountConvention
+    -- Dates
+    tradeDate            : Date
+    openingValueDate     : Date
+    maturityDate         : Date
+    applicableCalendar   : Text            -- e.g. "TARGET", "INR_CCIL"
+    -- Repurchase amount (pre-calculated or validated deterministically)
+    repurchaseAmount     : Decimal         -- must satisfy the agreed formula
+    -- Collateral basket / eligibility
+    collateralBasketId   : Optional Text   -- reference to EligibilityPolicy key
+    eligibleAssetClasses : [AssetClass]
+    collateralCurrency   : Text
+    haircut              : Decimal         -- e.g. 0.02 for 2%
+    concentrationLimit   : Decimal         -- max fraction in a single issuer/class
+    -- Margin conventions
+    marginFrequencyDays  : Int             -- 0 = daily, 1 = next business day, etc.
+    marginThreshold      : Decimal
+    minimumTransferAmount: Decimal
+    disputeWindowHours   : Int
+    -- Settlement
+    settlementSystemId   : Text            -- e.g. "CCIL", "Euroclear", "SWIFT"
+    settlementCutOffTime : Text            -- ISO 8601 time, e.g. "14:30:00+05:30"
+    -- Legal
+    masterAgreementRef   : Text            -- e.g. "GMRA2011-<LEI>-<LEI>"
+    legalEntityIdBorrower: Text            -- LEI of the borrower
+    legalEntityIdProvider: Text            -- LEI of the cash provider
+    -- Versioning
+    termsVersion         : Int
+    approvedBy           : Party           -- party that approved this version
+  deriving (Eq, Show)
+
+-- ---------------------------------------------------------------------------
+-- § 6.2  Collateral line record
+-- ---------------------------------------------------------------------------
+
+-- | A single line of collateral within an allocation.
+data CollateralLine = CollateralLine
+  with
+    instrumentId         : Text            -- ISIN or controlled internal identifier
+    quantity             : Decimal         -- nominal amount or share count
+    instrumentCurrency   : Text            -- denomination currency of the instrument
+    valuationCurrency    : Text            -- currency in which value is expressed
+    price                : Decimal         -- clean price per unit/nominal
+    priceSourceRef       : Text            -- reference to ValuationSnapshot
+    accruedInterest      : Decimal         -- per-unit accrued interest where applicable
+    haircut              : Decimal         -- applied haircut fraction, e.g. 0.02
+    eligibilityClass     : AssetClass
+    concentrationFraction: Decimal         -- fraction of total exposure this line covers
+    custodyAccountRef    : Optional Text   -- custody account or location reference
+    allocationStatus     : CollateralStatus
+    valuationTimestamp   : Time
+    freshnessLimitMinutes: Int             -- max age of valuation before stale
+  deriving (Eq, Show)
+
+-- ---------------------------------------------------------------------------
+-- § 9.3  External evidence reference (embedded in settlement contracts)
+-- ---------------------------------------------------------------------------
+
+-- | Lightweight external evidence pointer - avoid storing confidential payloads.
+data ExternalEvidenceRef = ExternalEvidenceRef
+  with
+    sourceSystem    : Text   -- e.g. "SWIFT", "CCIL", "Euroclear"
+    externalRef     : Text   -- the external system's unique reference
+    evidenceDigest  : Text   -- SHA-256 or similar of the evidence document
+    recordedAt      : Time
+    evidenceStatus  : Text   -- e.g. "Settled", "Failed"
+  deriving (Eq, Show)

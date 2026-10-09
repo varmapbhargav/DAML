@@ -1,0 +1,101 @@
+-- | Crown.BuySellBack
+-- Buy/sell-back agreement: paired initial sale and future repurchase legs.
+-- Architecture §5.3, §11.4
+module BuySellBack where
+
+import Types
+import DA.Date (Date)
+import DA.Time (Time)
+
+-- ---------------------------------------------------------------------------
+-- BuySellBackAgreement
+-- ---------------------------------------------------------------------------
+
+-- | `BuySellBackAgreement` — models an initial sale leg and a future
+-- repurchase leg with explicit terms and settlement evidence for each leg.
+--
+-- Architecture §11.4: legal characterization, accrued-interest treatment,
+-- coupon handling, and close-out differ across jurisdictions.
+-- This template does not assert legal characterization.
+template BuySellBackAgreement
+  with
+    agreementId              : Text
+    seller                   : Party           -- initial seller / future repurchaser
+    buyer                    : Party           -- initial buyer / future reseller
+    instrumentId             : Text            -- ISIN or controlled identifier
+    quantity                 : Decimal
+    initialPrice             : Decimal         -- clean price at initial sale
+    repurchasePrice          : Decimal         -- agreed forward repurchase price
+    currency                 : Text            -- ISO 4217
+    accruedInterestTreatment : Text            -- "Included" | "Separate"
+    couponPassThrough        : Bool            -- whether coupons are passed through
+    initialSettlementDate    : Date
+    repurchaseDate           : Date
+    masterAgreementRef       : Text
+    legalEntityIdSeller      : Text            -- LEI
+    legalEntityIdBuyer       : Text            -- LEI
+    status                   : Text            -- "Proposed" | "Accepted" | "InitialLegPending"
+                                               -- | "Active" | "RepurchaseLegPending" | "Closed"
+    initialEvidenceRef       : Optional Text   -- settlement evidence for initial leg
+    repurchaseEvidenceRef    : Optional Text   -- settlement evidence for repurchase leg
+    createdAt                : Time
+  where
+    signatory seller, buyer
+
+    ensure
+      quantity > 0.0
+      && initialPrice > 0.0
+      && repurchasePrice > 0.0
+      && repurchaseDate > initialSettlementDate
+
+    -- | Trigger initial settlement request.
+    choice RequestInitialSettlement : ContractId BuySellBackAgreement
+      with idempotencyKey : Text
+      controller seller, buyer
+      do
+        assertMsg "Agreement must be Accepted to request initial settlement"
+          (status == "Accepted")
+        create this with status = "InitialLegPending"
+
+    -- | Record initial settlement evidence (securities delivered, cash received).
+    choice RecordInitialLegEvidence : ContractId BuySellBackAgreement
+      with evidenceRef : Text
+      controller seller, buyer
+      do
+        assertMsg "Agreement must be in InitialLegPending status"
+          (status == "InitialLegPending")
+        assertMsg "Evidence reference must be provided"
+          (evidenceRef /= "")
+        create this with
+          status            = "Active"
+          initialEvidenceRef= Some evidenceRef
+
+    -- | Trigger repurchase settlement request at maturity.
+    choice RequestRepurchaseSettlement : ContractId BuySellBackAgreement
+      with idempotencyKey : Text
+      controller seller, buyer
+      do
+        assertMsg "Agreement must be Active to request repurchase settlement"
+          (status == "Active")
+        create this with status = "RepurchaseLegPending"
+
+    -- | Record repurchase leg evidence and close the agreement.
+    -- Architecture §11.4: both legs must have confirmed settlement evidence.
+    choice ConfirmRepurchaseAndClose : ()
+      with evidenceRef : Text
+      controller seller, buyer
+      do
+        assertMsg "Agreement must be in RepurchaseLegPending status"
+          (status == "RepurchaseLegPending")
+        assertMsg "Repurchase evidence must be provided"
+          (evidenceRef /= "")
+        return ()
+
+    -- | Cancel agreement before initial settlement (mutual consent).
+    choice CancelAgreement : ()
+      with reason : Text
+      controller seller, buyer
+      do
+        assertMsg "Only Proposed or Accepted agreements may be cancelled"
+          (status == "Proposed" || status == "Accepted")
+        return ()

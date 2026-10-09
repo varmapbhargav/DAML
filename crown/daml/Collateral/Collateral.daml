@@ -1,0 +1,107 @@
+-- | Crown.Collateral
+-- Collateral allocation, substitution, and release workflow.
+-- Architecture §8.1, §8.3, §8.4, §5.3, §5.5
+module Collateral where
+
+import Types
+import DA.Time (Time)
+
+-- ---------------------------------------------------------------------------
+-- CollateralAllocation
+-- ---------------------------------------------------------------------------
+
+-- | `CollateralAllocation` — encumbrance of collateral assets for a specific
+-- repo agreement. Both borrower and cashProvider are signatories so that
+-- neither party can unilaterally release or alter the allocation.
+--
+-- Architecture §8.4: prevents conflicting in-CROWN allocations;
+-- external double-pledging is addressed via custody evidence controls.
+template CollateralAllocation
+  with
+    allocationId       : Text              -- stable identifier for this allocation
+    agreementId        : Text              -- references the RepoAgreement
+    borrower           : Party
+    cashProvider       : Party
+    collateralLines    : [CollateralLine]  -- one or more collateral lines
+    totalMarketValue   : Decimal           -- sum of (quantity * price * (1 - haircut))
+    valuationCurrency  : Text
+    coverageRatio      : Decimal           -- totalMarketValue / principal exposure
+    status             : CollateralStatus
+    allocationVersion  : Int               -- incremented on substitution
+    lastUpdatedAt      : Time
+    eligibilityPolicyId: Text              -- references EligibilityPolicy
+  where
+    signatory borrower, cashProvider
+
+    ensure
+      totalMarketValue >= 0.0
+      && coverageRatio > 0.0
+      && allocationVersion >= 1
+      && (not (null collateralLines))
+
+    -- | Borrower proposes substitution of one or more collateral lines.
+    -- Architecture §8.3: replacement eligibility and coverage are checked
+    -- by the application before this choice is exercised.
+    choice RequestSubstitution : ContractId CollateralAllocation
+      with
+        newLines         : [CollateralLine] -- proposed replacement lines
+        newMarketValue   : Decimal
+        newCoverageRatio : Decimal
+        substitutionRef  : Text             -- idempotency / tracking reference
+      controller borrower
+      do
+        assertMsg "Collateral must be Allocated before substitution can be requested"
+          (status == Allocated)
+        assertMsg "Replacement lines must be provided"
+          (not (null newLines))
+        assertMsg "Post-substitution coverage must be positive"
+          (newCoverageRatio > 0.0)
+        now <- getTime
+        create this with
+          status           = SubstitutionPending
+          allocationVersion= allocationVersion + 1
+          lastUpdatedAt    = now
+
+    -- | Cash provider (or tri-party agent) approves proposed substitution.
+    -- Architecture §5.5: ApproveSubstitution - counterparty or agent per mandate.
+    choice ApproveSubstitution : ContractId CollateralAllocation
+      with
+        replacementLines  : [CollateralLine]
+        newMarketValue    : Decimal
+        newCoverageRatio  : Decimal
+        custodyEvidenceRef: Optional Text   -- settlement evidence once legs confirmed
+      controller cashProvider
+      do
+        assertMsg "Substitution must be pending before approval"
+          (status == SubstitutionPending)
+        assertMsg "Post-substitution coverage must be positive"
+          (newCoverageRatio > 0.0)
+        now <- getTime
+        create this with
+          collateralLines  = replacementLines
+          totalMarketValue = newMarketValue
+          coverageRatio    = newCoverageRatio
+          status           = Allocated
+          lastUpdatedAt    = now
+
+    -- | Release collateral when repo is closed (both parties authorize).
+    -- Architecture §8.3: old collateral is not released until evidence is validated.
+    choice Release : ()
+      with closingEvidenceRef : Text
+      controller borrower, cashProvider
+      do
+        assertMsg "Only Allocated collateral may be released"
+          (status == Allocated)
+        assertMsg "Closing evidence reference must be provided before release"
+          (closingEvidenceRef /= "")
+        return ()
+
+    -- | Mark allocation as requiring reconciliation (authorized adapter party).
+    choice FlagReconciliationRequired : ContractId CollateralAllocation
+      with reason : Text
+      controller borrower, cashProvider
+      do
+        now <- getTime
+        create this with
+          status        = CollateralReconciliationRequired
+          lastUpdatedAt = now

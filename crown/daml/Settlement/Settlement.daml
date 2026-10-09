@@ -1,0 +1,168 @@
+-- | Crown.Settlement
+-- Settlement instruction and evidence templates.
+-- Architecture §5.3, §5.5, §7.3, §9.1, §9.2, §9.3
+module Settlement where
+
+import Types
+import DA.Time (Time)
+
+-- ---------------------------------------------------------------------------
+-- SettlementInstruction
+-- ---------------------------------------------------------------------------
+
+-- | `SettlementInstruction` — describes an intended cash or securities
+-- movement to be executed on an external rail.
+--
+-- Architecture §9.2: idempotency key must be derived from a stable
+-- business identifier and operation version, not a random value.
+-- Architecture §9.3: external instruction state is independent of repo state.
+template SettlementInstruction
+  with
+    instructionId     : Text            -- stable business identifier
+    agreementId       : Text            -- scoped to a RepoAgreement
+    borrower          : Party
+    cashProvider      : Party
+    settlementRole    : Party           -- adapter party that will process this
+    legType           : LegType         -- CashLeg | SecuritiesLeg
+    amount            : Decimal         -- cash amount or securities nominal
+    currency          : Text            -- ISO 4217 for cash; instrument currency for securities
+    instrumentId      : Optional Text   -- ISIN, only for SecuritiesLeg
+    debitAccount      : Text            -- sending account reference
+    creditAccount     : Text            -- receiving account reference
+    settlementSystem  : Text            -- e.g. "CCIL", "Euroclear", "SWIFT"
+    valueDate         : Text            -- ISO 8601 settlement date
+    status            : SettlementStatus
+    idempotencyKey    : Text            -- must be stable across retries
+    requestedAt       : Time
+    externalRef       : Optional Text   -- reference returned by the external system
+  where
+    signatory borrower, cashProvider
+    observer settlementRole
+
+    ensure
+      amount > 0.0
+      && idempotencyKey /= ""
+      && debitAccount /= ""
+      && creditAccount /= ""
+
+    -- | Adapter submits instruction to external system.
+    -- Architecture §9.1: submitInstruction adapter boundary.
+    choice SubmitToExternal : ContractId SettlementInstruction
+      with externalRef : Text
+      controller settlementRole
+      do
+        assertMsg "Instruction must be in Prepared state to be submitted"
+          (status == Prepared)
+        assertMsg "External reference must be provided on submission"
+          (externalRef /= "")
+        now <- getTime
+        create this with
+          status      = Submitted
+          externalRef = Some externalRef
+
+    -- | External system acknowledges acceptance for processing.
+    choice AcknowledgeInstruction : ContractId SettlementInstruction
+      controller settlementRole
+      do
+        assertMsg "Instruction must be Submitted to be acknowledged"
+          (status == Submitted)
+        create this with status = Acknowledged
+
+    -- | Record final settled status after authoritative evidence received.
+    -- Architecture §7.3: Do not mark active until both legs are confirmed.
+    choice RecordSettled : (ContractId SettlementInstruction, ContractId SettlementEvidence)
+      with
+        evidence : ExternalEvidenceRef
+      controller settlementRole
+      do
+        assertMsg "Instruction must be Submitted or Acknowledged before recording settled"
+          (status == Submitted || status == Acknowledged || status == SettlementPending)
+        now <- getTime
+        newInstr <- create this with status = Settled
+        evid <- create SettlementEvidence
+          with
+            evidenceId      = instructionId <> "-ev"
+            instructionId   = instructionId
+            agreementId     = agreementId
+            borrower        = borrower
+            cashProvider    = cashProvider
+            settlementRole  = settlementRole
+            evidenceRef     = evidence
+            outcomeStatus   = Settled
+            recordedAt      = now
+        return (newInstr, evid)
+
+    -- | Record a final failure.
+    choice RecordFailure : (ContractId SettlementInstruction, ContractId SettlementEvidence)
+      with
+        evidence     : ExternalEvidenceRef
+        failureReason: Text
+      controller settlementRole
+      do
+        assertMsg "Instruction must be in an active state to record failure"
+          (status == Submitted || status == Acknowledged || status == SettlementPending)
+        now <- getTime
+        newInstr <- create this with status = SettlementFailed
+        evid <- create SettlementEvidence
+          with
+            evidenceId      = instructionId <> "-ev-fail"
+            instructionId   = instructionId
+            agreementId     = agreementId
+            borrower        = borrower
+            cashProvider    = cashProvider
+            settlementRole  = settlementRole
+            evidenceRef     = evidence
+            outcomeStatus   = SettlementFailed
+            recordedAt      = now
+        return (newInstr, evid)
+
+    -- | Flag as requiring reconciliation (partial/ambiguous evidence).
+    -- Architecture §9.3: ReconciliationRequired state.
+    choice FlagSettlementReconciliation : ContractId SettlementInstruction
+      with reason : Text
+      controller settlementRole
+      do
+        create this with status = ReconciliationRequired
+
+    -- | Cancel the instruction (only where the rail supports cancellation).
+    -- Architecture §9.1: cancelInstruction adapter boundary.
+    choice CancelInstruction : ContractId SettlementInstruction
+      with cancellationRef : Text
+      controller borrower, cashProvider
+      do
+        assertMsg "Only Prepared instructions may be cancelled on CROWN side"
+          (status == Prepared)
+        create this with status = SettlementCancelled
+
+-- ---------------------------------------------------------------------------
+-- SettlementEvidence
+-- ---------------------------------------------------------------------------
+
+-- | `SettlementEvidence` — external acknowledgement, confirmation, or
+-- failure evidence for a settlement instruction.
+-- Architecture §5.3: records source system, reference, timestamp, status
+-- and evidence digest.
+template SettlementEvidence
+  with
+    evidenceId     : Text
+    instructionId  : Text
+    agreementId    : Text
+    borrower       : Party
+    cashProvider   : Party
+    settlementRole : Party
+    evidenceRef    : ExternalEvidenceRef   -- from Types
+    outcomeStatus  : SettlementStatus
+    recordedAt     : Time
+  where
+    signatory borrower, cashProvider
+    observer settlementRole
+
+    ensure
+      evidenceId    /= ""
+      && instructionId /= ""
+
+    -- | Parties can acknowledge receipt of evidence.
+    choice AcknowledgeEvidence : ()
+      controller borrower, cashProvider
+      do
+        return ()

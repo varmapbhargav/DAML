@@ -1,0 +1,21 @@
+-- | Crown.Main
+-- Application entry point and configuration record.
+-- Architecture §17, §18.2
+module Main where
+
+-- ---------------------------------------------------------------------------
+-- ApplicationConfig
+-- ---------------------------------------------------------------------------
+
+-- | Top-level application configuration reference.
+-- Secrets and credentials must NOT appear here (Architecture §5.1 principle 9).
+data ApplicationConfig = ApplicationConfig
+  with
+    packageName         : Text      -- "crown"
+    packageVersion      : Text      -- semver e.g. "0.1.0"
+    environment         : Text      -- "local" | "test" | "uat" | "prod"
+    settlementSystemId  : Text      -- default settlement system identifier
+    defaultCalendar     : Text      -- default business-day calendar identifier
+    pricingSourceId     : Text      -- default pricing source identifier
+    operatorPartyHint   : Text      -- human-readable hint for the operator party
+  deriving (Eq, Show)

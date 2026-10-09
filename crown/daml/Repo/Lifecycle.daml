@@ -1,0 +1,142 @@
+-- | Crown.Repo.Lifecycle
+-- Repo lifecycle helpers: exception record and operational status tracker.
+-- Architecture §5.4, §14, §7.4
+module Repo.Lifecycle where
+
+import Types (AgreementStatus)
+
+-- ---------------------------------------------------------------------------
+-- ExceptionRecord
+-- ---------------------------------------------------------------------------
+
+-- | `ExceptionRecord` — tracks a detected lifecycle exception (settlement
+-- failure, stale valuation, margin dispute, overdue maturity, etc.).
+-- Architecture §14: classified exceptions route to AutoRetry or ManualReview.
+template ExceptionRecord
+  with
+    exceptionId      : Text
+    agreementId      : Text
+    raisedBy         : Party            -- party that raised the exception
+    counterparty     : Party            -- observer
+    operationsParty  : Party            -- operations team (observer and resolver)
+    exceptionType    : Text             -- "SettlementFailed" | "StaleValuation"
+                                        -- | "MarginDispute" | "OverdueMaturity"
+                                        -- | "DuplicateCallback" | "AmbiguousEvidence"
+    severity         : Text             -- "Transient" | "Financial" | "Ambiguous"
+    description      : Text
+    relatedRef       : Optional Text    -- e.g. instruction ID or margin call ID
+    status           : Text             -- "Detected" | "Classified" | "AutoRetry"
+                                        -- | "ManualReview" | "Corrected" | "Reconciled"
+                                        -- | "Resolved" | "Escalated"
+    attemptCount     : Int
+    createdAt        : Time
+    resolvedAt       : Optional Time
+  where
+    signatory raisedBy
+    observer counterparty, operationsParty
+
+    ensure
+      exceptionId /= ""
+      && description /= ""
+
+    -- | Operations classifies the exception as transient (eligible for retry).
+    choice ClassifyAsTransient : ContractId ExceptionRecord
+      controller operationsParty
+      do
+        assertMsg "Exception must be Detected to be classified"
+          (status == "Detected")
+        create this with status = "AutoRetry"
+
+    -- | Operations classifies the exception as financial / requiring manual review.
+    choice ClassifyAsManualReview : ContractId ExceptionRecord
+      with classification : Text
+      controller operationsParty
+      do
+        assertMsg "Exception must be Detected to be classified"
+          (status == "Detected")
+        create this with
+          status      = "ManualReview"
+          description = description <> " [Classification: " <> classification <> "]"
+
+    -- | Record a retry attempt.
+    choice RecordRetryAttempt : ContractId ExceptionRecord
+      controller raisedBy
+      do
+        assertMsg "Exception must be in AutoRetry state"
+          (status == "AutoRetry")
+        create this with attemptCount = attemptCount + 1
+
+    -- | Operations records an authorized remediation.
+    choice RecordCorrection : ContractId ExceptionRecord
+      with correctionRef : Text
+      controller operationsParty
+      do
+        assertMsg "Exception must be in ManualReview to be corrected"
+          (status == "ManualReview")
+        create this with status = "Corrected"
+
+    -- | Operations confirms reconciliation of the exception.
+    choice RecordReconciliation : ContractId ExceptionRecord
+      with reconciliationRef : Text
+      controller operationsParty
+      do
+        assertMsg "Exception must be Corrected to be reconciled"
+          (status == "Corrected")
+        create this with status = "Reconciled"
+
+    -- | Mark the exception as resolved.
+    choice ResolveException : ()
+      with resolutionRef : Text
+      controller operationsParty
+      do
+        assertMsg "Exception must be Reconciled or AutoRetry (success) to be resolved"
+          (status == "Reconciled" || status == "AutoRetry")
+        return ()
+
+    -- | Escalate when SLA or risk threshold is breached.
+    choice EscalateException : ContractId ExceptionRecord
+      with escalationReason : Text
+      controller operationsParty
+      do
+        assertMsg "Exception must be in ManualReview to be escalated"
+          (status == "ManualReview")
+        create this with status = "Escalated"
+
+-- ---------------------------------------------------------------------------
+-- RepoLifecycleStatus (operational read-model contract)
+-- ---------------------------------------------------------------------------
+
+-- | Tracks the current lifecycle position of a repo for operational
+-- monitoring. This is a read-model contract, NOT the authoritative
+-- contractual state — that is the RepoAgreement itself.
+-- Architecture §3.2: read model is for dashboards; it is not authoritative.
+template RepoLifecycleStatus
+  with
+    agreementId     : Text
+    borrower        : Party
+    cashProvider    : Party
+    currentStatus   : AgreementStatus
+    openExceptions  : Int               -- count of open ExceptionRecords
+    openMarginCalls : Int               -- count of open MarginCalls
+    lastUpdatedAt   : Time
+  where
+    signatory borrower, cashProvider
+
+    ensure
+      openExceptions  >= 0
+      && openMarginCalls >= 0
+
+    -- | Update the status snapshot from the authoritative agreement state.
+    choice UpdateLifecycleStatus : ContractId RepoLifecycleStatus
+      with
+        newStatus        : AgreementStatus
+        newExceptions    : Int
+        newMarginCalls   : Int
+        updatedAt        : Time
+      controller borrower, cashProvider
+      do
+        create this with
+          currentStatus   = newStatus
+          openExceptions  = newExceptions
+          openMarginCalls = newMarginCalls
+          lastUpdatedAt   = updatedAt

@@ -1,0 +1,109 @@
+-- | Crown.Governance
+-- Policy approval and package versioning governance contracts.
+-- Architecture §5.1 (principle 10), §15.2, §19.3
+module Governance where
+
+import DA.Time (Time)
+import DA.Date (Date)
+
+-- ---------------------------------------------------------------------------
+-- PolicyApproval
+-- ---------------------------------------------------------------------------
+
+-- | `PolicyApproval` — records authorized approval of a governance policy
+-- (e.g. eligibility rules, day-count conventions, margin methods).
+-- Multiple approvers may be required; the contract captures all of them.
+--
+-- Architecture §5.1 principle 10: financial conventions must be explicit
+-- and governed.
+template PolicyApproval
+  with
+    policyId      : Text
+    policyType    : Text            -- e.g. "EligibilityPolicy" | "MarginConvention"
+    version       : Int
+    description   : Text
+    operator      : Party           -- CROWN operator that proposes the policy
+    approvers     : [Party]         -- parties whose sign-off is required
+    signatures    : [Party]         -- parties that have signed so far
+    effectiveDate : Date
+    expiryDate    : Optional Date
+    approvedAt    : Optional Time
+    status        : Text            -- "Draft" | "PendingApproval" | "Approved" | "Superseded"
+  where
+    signatory operator
+    observer approvers
+
+    ensure
+      version > 0
+      && policyId /= ""
+      && (not (null approvers))
+
+    -- | An approver signs off on the policy.
+    choice SignPolicy : ContractId PolicyApproval
+      with signer : Party
+      controller signer
+      do
+        assertMsg "Signer must be an authorized approver"
+          (signer `elem` approvers)
+        assertMsg "Policy must be in PendingApproval state"
+          (status == "PendingApproval")
+        let newSigs = signatures ++ [signer]
+        now <- getTime
+        if length newSigs >= length approvers
+          then create this with
+                 signatures = newSigs
+                 status     = "Approved"
+                 approvedAt = Some now
+          else create this with
+                 signatures = newSigs
+
+    -- | Operator submits the policy for approval review.
+    choice SubmitForApproval : ContractId PolicyApproval
+      controller operator
+      do
+        assertMsg "Policy must be in Draft to submit"
+          (status == "Draft")
+        create this with status = "PendingApproval"
+
+    -- | Operator supersedes an approved policy with a new version.
+    choice SupersedePolicy : ContractId PolicyApproval
+      with newVersionId : Text
+      controller operator
+      do
+        assertMsg "Only Approved policies may be superseded"
+          (status == "Approved")
+        create this with status = "Superseded"
+
+-- ---------------------------------------------------------------------------
+-- PackageVersionRecord
+-- ---------------------------------------------------------------------------
+
+-- | Records the vetted and deployed version of a DAML package.
+-- Architecture §19.3, §10.3: package upgrade changes semantics;
+-- track package versions with approval provenance.
+template PackageVersionRecord
+  with
+    packageName       : Text
+    packageVersion    : Text       -- semver e.g. "1.2.0"
+    packageHash       : Text       -- DAR content hash
+    operator          : Party
+    approvedBy        : [Party]
+    deployedAt        : Time
+    environment       : Text       -- "test" | "uat" | "prod"
+    changelogRef      : Text       -- reference to changelog / release notes
+  where
+    signatory operator
+
+    ensure
+      packageName /= ""
+      && packageVersion /= ""
+      && packageHash /= ""
+
+    -- | Record that an upgrade is in progress.
+    choice RecordUpgradeStart : ContractId PackageVersionRecord
+      with newVersion : PackageVersionRecord
+      controller operator
+      do
+        assertMsg "New version must differ from current"
+          (newVersion.packageVersion /= packageVersion)
+        create newVersion

@@ -1,0 +1,97 @@
+-- | Crown.SecuritiesLending
+-- Securities loan, fee, and return workflow template.
+-- Architecture §5.3, §11.3
+module SecuritiesLending where
+
+import Types
+import DA.Date (Date)
+import DA.Time (Time)
+
+-- ---------------------------------------------------------------------------
+-- SecuritiesLoan
+-- ---------------------------------------------------------------------------
+
+-- | `SecuritiesLoan` — represents a loan of securities from a lender to
+-- a borrower, with fee accrual, collateral, and return obligations.
+--
+-- Architecture §11.3: lending and borrowing are opposite perspectives of
+-- the same transaction; shared loan agreement with role-specific views.
+template SecuritiesLoan
+  with
+    loanId               : Text
+    lender               : Party           -- securities lender (signatory)
+    borrower             : Party           -- securities borrower (signatory)
+    instrumentId         : Text            -- ISIN or controlled identifier
+    quantity             : Decimal         -- loaned quantity
+    instrumentCurrency   : Text
+    feeRate              : Decimal         -- annualised lending fee rate
+    feeAccrualConvention : Text            -- e.g. "Actual360", "Actual365"
+    collateralAmount     : Decimal         -- collateral pledged by borrower
+    collateralCurrency   : Text
+    collateralType       : Text            -- "Cash" | "Securities"
+    haircut              : Decimal
+    openDate             : Date
+    expectedReturnDate   : Date
+    status               : Text            -- "Open" | "RecallPending" | "ReturnPending" | "Closed"
+    masterAgreementRef   : Text            -- e.g. "GMSLA2010-<LEI>-<LEI>"
+    deliveryEvidenceRef  : Optional Text   -- references delivery settlement evidence
+    returnEvidenceRef    : Optional Text   -- references return settlement evidence
+    createdAt            : Time
+  where
+    signatory lender, borrower
+
+    ensure
+      quantity > 0.0
+      && feeRate >= 0.0
+      && collateralAmount > 0.0
+      && haircut >= 0.0 && haircut < 1.0
+      && expectedReturnDate >= openDate
+
+    -- | Lender issues a recall for the loaned securities.
+    choice RecallLoan : ContractId SecuritiesLoan
+      with
+        recallDate   : Date
+        recallReason : Text
+      controller lender
+      do
+        assertMsg "Only Open loans may be recalled"
+          (status == "Open")
+        assertMsg "Recall date must be in the future relative to open date"
+          (recallDate >= openDate)
+        create this with status = "RecallPending"
+
+    -- | Borrower initiates voluntary return.
+    choice InitiateReturn : ContractId SecuritiesLoan
+      with returnDate : Date
+      controller borrower
+      do
+        assertMsg "Only Open or RecallPending loans may be returned"
+          (status == "Open" || status == "RecallPending")
+        create this with status = "ReturnPending"
+
+    -- | Record delivery evidence for the opening securities leg.
+    choice RecordDeliveryEvidence : ContractId SecuritiesLoan
+      with evidenceRef : Text
+      controller lender, borrower
+      do
+        assertMsg "Delivery evidence must be provided"
+          (evidenceRef /= "")
+        create this with deliveryEvidenceRef = Some evidenceRef
+
+    -- | Close the loan after return and collateral release are confirmed.
+    choice CloseLoan : ()
+      with returnRef : Text
+      controller lender, borrower
+      do
+        assertMsg "Loan must be in ReturnPending status to be closed"
+          (status == "ReturnPending")
+        assertMsg "Return evidence reference must be provided"
+          (returnRef /= "")
+        return ()
+
+    -- | Record a failure-to-deliver / failure-to-return event.
+    choice RecordFailureToDeliver : ContractId SecuritiesLoan
+      with failureReason : Text
+      controller lender, borrower
+      do
+        create this with status = "FailureToDeliver"

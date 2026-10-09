@@ -1,0 +1,98 @@
+-- | Crown.Audit
+-- Authorized evidence references and audit records.
+-- Architecture §5.3, §10.2, §10.3
+module Audit where
+
+import Types
+import DA.Time (Time)
+
+-- ---------------------------------------------------------------------------
+-- EvidenceReference (contract, not just a record)
+-- ---------------------------------------------------------------------------
+
+-- | `EvidenceReference` — an authorized pointer to supporting records.
+-- This is NOT a universal audit bypass; access is controlled by the
+-- parties who are signatories and observers.
+--
+-- Architecture §5.3: records source system, reference, timestamp, status
+-- and evidence digest where appropriate. Avoid storing secrets.
+template EvidenceReference
+  with
+    evidenceId       : Text
+    relatedContractId: Optional Text   -- ledger contract ID this evidence supports
+    agreementId      : Text
+    borrower         : Party
+    cashProvider     : Party
+    auditService     : Party           -- authorized audit/compliance party
+    sourceSystem     : Text            -- e.g. "SWIFT", "CCIL", "Euroclear"
+    externalRef      : Text            -- external system reference
+    evidenceType     : Text            -- "SettlementConfirmation" | "ValuationCertificate"
+                                       -- | "MarginCallEvidence" | "CollateralCustody"
+    evidenceDigest   : Text            -- SHA-256 or similar hash of the evidence document
+    recordedAt       : Time
+    recordedBy       : Party           -- party that submitted this reference
+  where
+    signatory borrower, cashProvider
+    observer auditService
+
+    ensure
+      evidenceId     /= ""
+      && externalRef /= ""
+      && evidenceDigest /= ""
+
+    -- | Audit service acknowledges and logs access to this evidence.
+    choice AcknowledgeEvidenceAccess : ()
+      controller auditService
+      do
+        return ()
+
+    -- | Mark evidence as superseded (e.g. corrected by the source system).
+    choice SupersedeEvidence : ContractId EvidenceReference
+      with
+        newEvidenceId  : Text
+        supersessionRef: Text
+      controller borrower, cashProvider
+      do
+        assertMsg "New evidence ID must differ"
+          (newEvidenceId /= evidenceId)
+        now <- getTime
+        create this with
+          evidenceId  = newEvidenceId
+          externalRef = supersessionRef
+          recordedAt  = now
+
+-- ---------------------------------------------------------------------------
+-- AuditLog (immutable operational event record)
+-- ---------------------------------------------------------------------------
+
+-- | `AuditLog` — records who initiated an action, which party authorized it,
+-- the relevant contract/instruction reference, timestamps, and outcome.
+-- Architecture §20.2: use a correlation ID across UI, API, workflow worker,
+-- ledger command, adapter request, and external reference.
+template AuditLog
+  with
+    logId           : Text
+    correlationId   : Text             -- trace from UI to ledger to adapter
+    causationId     : Optional Text    -- what caused this event
+    eventType       : Text             -- e.g. "ProposalCreated", "MarginCallRaised"
+    initiatingParty : Party
+    authorizedBy    : Party            -- Daml party that exercised the choice
+    contractRef     : Optional Text    -- ledger contract ID
+    agreementId     : Text
+    occurredAt      : Time
+    outcome         : Text             -- "Success" | "Rejected" | "Failed"
+    details         : Text             -- non-sensitive operational detail
+    auditService    : Party
+  where
+    signatory initiatingParty, authorizedBy
+    observer auditService
+
+    ensure
+      logId         /= ""
+      && correlationId /= ""
+
+    -- | Audit service acknowledges and indexes this log entry.
+    choice IndexAuditLog : ()
+      controller auditService
+      do
+        return ()

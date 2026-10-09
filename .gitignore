@@ -1,0 +1,5 @@
+# Workspace-local DPM components and cache
+/.tools/
+
+# VS Code workspace settings
+/.vscode/

@@ -1,0 +1,113 @@
+-- | Crown.Compliance
+-- Compliance check records and regulatory reporting references.
+-- Architecture §4.1, §10.2, §15.3
+module Compliance where
+
+import DA.Time (Time)
+
+-- ---------------------------------------------------------------------------
+-- ComplianceCheck
+-- ---------------------------------------------------------------------------
+
+-- | `ComplianceCheck` — a compliance review record against a specific
+-- agreement or instruction. The compliance officer party is signatory.
+-- The reviewed parties are observers.
+--
+-- Architecture §4.1: auditor/compliance role has explicitly authorized
+-- access only. Records are not a universal audit bypass.
+template ComplianceCheck
+  with
+    checkId          : Text
+    agreementId      : Text
+    complianceOfficer: Party           -- authorized reviewer (signatory)
+    reviewedParties  : [Party]         -- parties subject to this review (observers)
+    checkType        : Text            -- "PreTrade" | "PostTrade" | "Margin" | "Reporting"
+    status           : Text            -- "Pending" | "Passed" | "Failed" | "Waived"
+    remarks          : Text
+    regulatoryRef    : Optional Text   -- reference to regulatory reporting record
+    reviewedAt       : Time
+    expiresAt        : Optional Time
+  where
+    signatory complianceOfficer
+    observer reviewedParties
+
+    ensure
+      checkId /= ""
+      && agreementId /= ""
+
+    -- | Record a pass outcome.
+    choice RecordPass : ContractId ComplianceCheck
+      with evidence : Text
+      controller complianceOfficer
+      do
+        assertMsg "Check must be Pending to be recorded as passed"
+          (status == "Pending")
+        create this with
+          status  = "Passed"
+          remarks = evidence
+
+    -- | Record a fail outcome.
+    choice RecordFail : ContractId ComplianceCheck
+      with reason : Text
+      controller complianceOfficer
+      do
+        assertMsg "Check must be Pending to be recorded as failed"
+          (status == "Pending")
+        assertMsg "Failure reason must be provided"
+          (reason /= "")
+        create this with
+          status  = "Failed"
+          remarks = reason
+
+    -- | Waive the check with documented justification.
+    choice WaiveCheck : ContractId ComplianceCheck
+      with justification : Text
+      controller complianceOfficer
+      do
+        assertMsg "Check must be Pending to be waived"
+          (status == "Pending")
+        assertMsg "Waiver justification must be provided"
+          (justification /= "")
+        create this with
+          status  = "Waived"
+          remarks = justification
+
+-- ---------------------------------------------------------------------------
+-- RegulatoryReportingRecord
+-- ---------------------------------------------------------------------------
+
+-- | Records the submission of a regulatory report (e.g. trade reporting).
+-- Architecture §15.3: mandated reporting obligations depend on jurisdiction.
+-- This contract does NOT substitute for the actual regulatory submission.
+template RegulatoryReportingRecord
+  with
+    reportId        : Text
+    agreementId     : Text
+    reportType      : Text        -- e.g. "EMIR", "CFTC", "SEBI_CCIL"
+    submittingParty : Party
+    status          : Text        -- "Submitted" | "Accepted" | "Rejected" | "Amended"
+    externalRef     : Optional Text
+    submittedAt     : Time
+    reportingAuthority : Text
+  where
+    signatory submittingParty
+
+    ensure
+      reportId /= ""
+      && agreementId /= ""
+
+    -- | Record acceptance by the regulatory authority.
+    choice RecordRegAcceptance : ContractId RegulatoryReportingRecord
+      with externalRef : Text
+      controller submittingParty
+      do
+        create this with
+          status      = "Accepted"
+          externalRef = Some externalRef
+
+    -- | Record rejection and flag for amendment.
+    choice RecordRegRejection : ContractId RegulatoryReportingRecord
+      with reason : Text
+      controller submittingParty
+      do
+        create this with status = "Rejected"

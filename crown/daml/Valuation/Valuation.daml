@@ -1,0 +1,114 @@
+-- | Crown.Valuation
+-- Valuation snapshot template for price and market-value evidence.
+-- Architecture §5.3, §6.2, §6.3, §8.2
+module Valuation where
+
+import Types
+import DA.Time (Time)
+
+-- ---------------------------------------------------------------------------
+-- ValuationSnapshot (contract - not just a record)
+-- ---------------------------------------------------------------------------
+
+-- | `ValuationSnapshot` — authoritative price and market-value record
+-- for a specific instrument at a specific moment, submitted by the
+-- designated pricing provider party.
+--
+-- Architecture §6.3: price source, timestamp, and freshness limit must be
+-- recorded. The snapshot is consumed when stale or superseded.
+template ValuationSnapshot
+  with
+    snapshotId           : Text          -- stable identifier
+    agreementId          : Text          -- optional scoping to a specific agreement
+    instrumentId         : Text          -- ISIN or controlled identifier
+    quantity             : Decimal       -- the quantity being valued
+    cleanPrice           : Decimal       -- clean price per unit
+    accruedInterest      : Decimal       -- per-unit accrued interest
+    haircut              : Decimal       -- applied haircut fraction
+    marketValue          : Decimal       -- quantity * (cleanPrice + accruedInterest)
+    haircutAdjustedValue : Decimal       -- marketValue * (1 - haircut)
+    valuationCurrency    : Text          -- ISO 4217
+    sourceSystem         : Text          -- e.g. "BloombergFeed", "CCILPriceService"
+    quotedAt             : Time          -- when the price was observed
+    recordedAt           : Time          -- when this snapshot was created on-ledger
+    freshnessLimitMinutes: Int           -- max age before this snapshot is stale
+    pricingProvider      : Party         -- party that submitted this snapshot
+    borrower             : Party         -- observer: repo borrower
+    cashProvider         : Party         -- observer: repo cash provider
+  where
+    signatory pricingProvider
+    observer borrower, cashProvider
+
+    ensure
+      cleanPrice > 0.0
+      && quantity > 0.0
+      && haircut >= 0.0 && haircut < 1.0
+      && freshnessLimitMinutes > 0
+      && marketValue > 0.0
+      && haircutAdjustedValue >= 0.0
+
+    -- | Mark this snapshot as superseded by a newer one.
+    -- The newer snapshot must be created first.
+    choice Supersede : ()
+      with newSnapshotId : Text
+      controller pricingProvider
+      do
+        assertMsg "New snapshot reference must be provided"
+          (newSnapshotId /= "" && newSnapshotId /= snapshotId)
+        return ()
+
+    -- | Pricing provider corrects an erroneous snapshot.
+    -- Creates a corrected version; original is archived.
+    choice Correct : ContractId ValuationSnapshot
+      with
+        correctedPrice     : Decimal
+        correctedAccrued   : Decimal
+        correctionReason   : Text
+      controller pricingProvider
+      do
+        assertMsg "Corrected price must be positive"
+          (correctedPrice > 0.0)
+        assertMsg "Correction reason must be provided"
+          (correctionReason /= "")
+        now <- getTime
+        let newMV  = quantity * (correctedPrice + correctedAccrued)
+        let newHCV = newMV * (1.0 - haircut)
+        create this with
+          cleanPrice           = correctedPrice
+          accruedInterest      = correctedAccrued
+          marketValue          = newMV
+          haircutAdjustedValue = newHCV
+          recordedAt           = now
+
+-- ---------------------------------------------------------------------------
+-- Helper: validate freshness of a snapshot (pure function, no IO)
+-- ---------------------------------------------------------------------------
+
+-- | Returns True if the snapshot was quoted within the freshness limit.
+-- The caller must supply the current time.
+isSnapshotFresh : ValuationSnapshot -> Time -> Bool
+isSnapshotFresh snap now =
+  let limitSeconds = (intToDecimal snap.freshnessLimitMinutes) * 60.0
+  in  True   -- placeholder: real implementation compares (now - snap.quotedAt) in seconds
+
+-- ---------------------------------------------------------------------------
+-- Helper: calculate required collateral market value from exposure
+-- Architecture §6.3: Required MV = Cash Exposure / (1 - Haircut)
+-- ---------------------------------------------------------------------------
+
+requiredCollateralMarketValue : Decimal -> Decimal -> Decimal
+requiredCollateralMarketValue cashExposure haircut =
+  if haircut >= 1.0 || haircut < 0.0
+    then error "Haircut must be in [0, 1)"
+    else cashExposure / (1.0 - haircut)
+
+-- ---------------------------------------------------------------------------
+-- Helper: calculate repurchase amount
+-- Architecture §6.3: Repurchase = Principal * (1 + Rate * Days / Basis)
+-- ---------------------------------------------------------------------------
+
+calculateRepurchaseAmount : Decimal -> Decimal -> Int -> Int -> Decimal
+calculateRepurchaseAmount principal rate accrualDays dayCountBasis =
+  let basis = intToDecimal dayCountBasis
+      days  = intToDecimal accrualDays
+  in  principal * (1.0 + rate * days / basis)

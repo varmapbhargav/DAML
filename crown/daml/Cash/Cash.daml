@@ -1,0 +1,65 @@
+-- | Crown.Cash
+-- Cash leg descriptor for settlement instructions.
+-- Architecture §7.3, §9.1
+module Cash where
+
+import DA.Date (Date)
+import DA.Time (Time)
+
+-- ---------------------------------------------------------------------------
+-- CashLeg record (embedded in settlement instructions)
+-- ---------------------------------------------------------------------------
+
+-- | Describes a cash payment leg to be included in a settlement instruction.
+-- Monetary amounts are represented as Decimal; the application layer must
+-- enforce the agreed currency precision and rounding policy.
+data CashLeg = CashLeg
+  with
+    cashAccount       : Text      -- account identifier (opaque to the ledger)
+    amount            : Decimal   -- payment amount in minor-unit terms
+    currency          : Text      -- ISO 4217 currency code
+    settlementDate    : Date      -- value date for the cash movement
+    paymentSystemRef  : Text      -- e.g. "RTGS-CCIL", "SWIFT-CHIPS"
+    idempotencyKey    : Text      -- stable key preventing duplicate payments
+  deriving (Eq, Show)
+
+-- ---------------------------------------------------------------------------
+-- CashSettlementConfirmation (contract)
+-- ---------------------------------------------------------------------------
+
+-- | `CashSettlementConfirmation` — on-ledger record confirming that a cash
+-- payment has been received and acknowledged by the receiving party.
+-- The actual movement occurs in the external payment system; this contract
+-- records the authoritative evidence reference.
+--
+-- Architecture §3.2: "Settlement requested" is NOT "settled".
+-- This contract is only created after authoritative external evidence exists.
+template CashSettlementConfirmation
+  with
+    confirmationId   : Text
+    agreementId      : Text
+    payer            : Party        -- party making the payment
+    payee            : Party        -- party receiving the payment
+    settlementRole   : Party        -- adapter party that submitted evidence
+    amount           : Decimal
+    currency         : Text
+    paymentSystemRef : Text
+    externalRef      : Text         -- external payment system reference
+    evidenceDigest   : Text         -- hash of external confirmation document
+    confirmedAt      : Time
+    idempotencyKey   : Text
+  where
+    signatory payer, payee
+    observer settlementRole
+
+    ensure
+      amount > 0.0
+      && externalRef /= ""
+      && evidenceDigest /= ""
+      && idempotencyKey /= ""
+
+    -- | Either party acknowledges receipt of this confirmation record.
+    choice AcknowledgeCashConfirmation : ()
+      controller payee
+      do
+        return ()
